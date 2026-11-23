@@ -115,3 +115,68 @@ func FuzzEntityTags(f *testing.F) {
 		}
 	})
 }
+
+func TestWriteConditionsNeedsETag(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		header http.Header
+		want   bool
+	}{
+		{"ExistenceOnly", http.Header{"If-Match": {"*"}, "If-None-Match": {"*"}}, false},
+		{"MatchTag", http.Header{"If-Match": {`"etag"`}}, true},
+		{"NoneMatchTag", http.Header{"If-None-Match": {`W/"etag"`}}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conditions, err := ParseWriteConditions(test.header)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, conditions.NeedsETag())
+		})
+	}
+}
+
+func TestCheckPutConditions(t *testing.T) {
+	invalid := `"unterminated`
+	etag := `"etag"`
+	for _, test := range []struct {
+		name       string
+		conditions *PutConditions
+		exists     bool
+		want       error
+	}{
+		{"Unconditional", nil, false, nil},
+		{"InvalidMatch", &PutConditions{IfMatch: &invalid}, true, ErrInvalidArgument},
+		{"InvalidNoneMatch", &PutConditions{IfNoneMatch: &invalid}, true, ErrInvalidArgument},
+		{"MissingDestination", &PutConditions{IfMatch: &etag}, false, ErrPreconditionFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := CheckPutConditions(test.conditions, &ConditionalObjectInfo{Exists: test.exists})
+			assert.Equal(t, test.want, err)
+		})
+	}
+}
+
+func TestCheckCopySource(t *testing.T) {
+	const (
+		prefix = "X-Amz-Copy-Source-"
+		before = "Mon, 02 Jan 2006 15:04:04 GMT"
+		at     = "Mon, 02 Jan 2006 15:04:05 GMT"
+	)
+	obj := &Object{Hash: []byte{0xab}, Metadata: map[string]string{"Last-Modified": at}}
+	for _, test := range []struct {
+		name   string
+		header http.Header
+		want   error
+	}{
+		{"InvalidMatch", http.Header{prefix + "If-Match": {`"ab`}}, ErrInvalidArgument},
+		{"UnmodifiedSinceFails", http.Header{prefix + "If-Unmodified-Since": {before}}, ErrPreconditionFailed},
+		{"ModifiedSinceFailsAtSameTime", http.Header{prefix + "If-Modified-Since": {at}}, ErrPreconditionFailed},
+		{"ModifiedSincePasses", http.Header{prefix + "If-Modified-Since": {before}}, nil},
+		{"UnmodifiedSincePassesAtSameTime", http.Header{prefix + "If-Unmodified-Since": {at}}, nil},
+		{"MatchTakesPrecedence", http.Header{prefix + "If-Match": {`"wrong"`, `"ab"`}, prefix + "If-Unmodified-Since": {before}}, nil},
+		{"NoneMatchTakesPrecedence", http.Header{prefix + "If-None-Match": {`"other"`}, prefix + "If-Modified-Since": {at}}, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, checkCopySource(test.header, obj))
+		})
+	}
+}

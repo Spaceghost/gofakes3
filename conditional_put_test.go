@@ -3,14 +3,21 @@ package gofakes3_test
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
+	"io"
 	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/spf13/afero"
+	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/johannesboyne/gofakes3"
@@ -415,4 +422,172 @@ func TestConditionalMultipartCompletion(t *testing.T) {
 	in.IfMatch = existing.ETag
 	_, err = svc.CompleteMultipartUpload(context.Background(), in)
 	ts.OK(err)
+}
+
+type conditionalWriteTestBackend struct {
+	gofakes3.Backend
+	put  func(string, string, io.Reader, int64, *gofakes3.WriteConditions) (gofakes3.PutObjectResult, error)
+	copy func(string, string, string, string, *gofakes3.WriteConditions) (gofakes3.CopyObjectResult, error)
+}
+
+func (b conditionalWriteTestBackend) PutObjectConditional(bucket, key string, _ map[string]string, input io.Reader, size int64, conditions *gofakes3.WriteConditions) (gofakes3.PutObjectResult, error) {
+	return b.put(bucket, key, input, size, conditions)
+}
+
+func (b conditionalWriteTestBackend) CopyObjectConditional(srcBucket, srcKey, dstBucket, dstKey string, _ map[string]string, conditions *gofakes3.WriteConditions) (gofakes3.CopyObjectResult, error) {
+	return b.copy(srcBucket, srcKey, dstBucket, dstKey, conditions)
+}
+
+func TestConditionalWriteBackendDispatch(t *testing.T) {
+	const data = "replacement"
+	const destination = "destination"
+	path := "/" + defaultBucket + "/" + destination
+
+	for _, operation := range []string{"Put", "Copy", "Multipart"} {
+		t.Run(operation, func(t *testing.T) {
+			base := s3mem.New()
+			require.NoError(t, base.CreateBucket(defaultBucket))
+			_, err := base.PutObject(defaultBucket, "source", nil, strings.NewReader(data), int64(len(data)), nil)
+			require.NoError(t, err)
+
+			calls := 0
+			checkDestination := func(bucket, key string, conditions *gofakes3.WriteConditions) {
+				calls++
+				require.Equal(t, defaultBucket, bucket)
+				require.Equal(t, destination, key)
+				require.NoError(t, conditions.Check(false, ""))
+				require.Equal(t, gofakes3.ErrPreconditionFailed, conditions.Check(true, `"etag"`))
+			}
+			backend := conditionalWriteTestBackend{
+				Backend: base,
+				put: func(bucket, key string, input io.Reader, size int64, conditions *gofakes3.WriteConditions) (gofakes3.PutObjectResult, error) {
+					require.NotEqual(t, "Copy", operation)
+					checkDestination(bucket, key, conditions)
+					require.EqualValues(t, len(data), size)
+					body, err := io.ReadAll(input)
+					require.NoError(t, err)
+					require.Equal(t, data, string(body))
+					return gofakes3.PutObjectResult{}, gofakes3.ErrConditionalRequestConflict
+				},
+				copy: func(srcBucket, srcKey, dstBucket, dstKey string, conditions *gofakes3.WriteConditions) (gofakes3.CopyObjectResult, error) {
+					require.Equal(t, "Copy", operation)
+					checkDestination(dstBucket, dstKey, conditions)
+					require.Equal(t, defaultBucket, srcBucket)
+					require.Equal(t, "source", srcKey)
+					return gofakes3.CopyObjectResult{}, gofakes3.ErrConditionalRequestConflict
+				},
+			}
+			handler := gofakes3.New(backend).Server()
+
+			var req *http.Request
+			switch operation {
+			case "Put":
+				req = httptest.NewRequest(http.MethodPut, path, strings.NewReader(data))
+				req.Header.Set("Content-Length", strconv.Itoa(len(data)))
+			case "Copy":
+				req = httptest.NewRequest(http.MethodPut, path, nil)
+				req.Header.Set("X-Amz-Copy-Source", "/"+defaultBucket+"/source")
+			case "Multipart":
+				req = multipartCompletionRequest(t, handler, path, data)
+			}
+			req.Header.Set("If-None-Match", "*")
+			assertConditionalResponse(t, handler, req, http.StatusConflict, gofakes3.ErrConditionalRequestConflict)
+			require.Equal(t, 1, calls)
+			_, err = base.HeadObject(defaultBucket, destination)
+			require.True(t, gofakes3.HasErrorCode(err, gofakes3.ErrNoSuchKey), "expected no destination, got %v", err)
+		})
+	}
+}
+
+func multipartCompletionRequest(t *testing.T, handler http.Handler, path, data string) *http.Request {
+	t.Helper()
+	init := httptest.NewRecorder()
+	handler.ServeHTTP(init, httptest.NewRequest(http.MethodPost, path+"?uploads", nil))
+	require.Equal(t, http.StatusOK, init.Code, init.Body.String())
+	var upload gofakes3.InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(init.Body.Bytes(), &upload))
+
+	part := httptest.NewRecorder()
+	partReq := httptest.NewRequest(http.MethodPut, path+"?partNumber=1&uploadId="+string(upload.UploadID), strings.NewReader(data))
+	partReq.Header.Set("Content-Length", strconv.Itoa(len(data)))
+	handler.ServeHTTP(part, partReq)
+	require.Equal(t, http.StatusOK, part.Code, part.Body.String())
+	body, err := xml.Marshal(gofakes3.CompleteMultipartUploadRequest{
+		Parts: []gofakes3.CompletedPart{{PartNumber: 1, ETag: part.Header().Get("ETag")}},
+	})
+	require.NoError(t, err)
+
+	return httptest.NewRequest(http.MethodPost, path+"?uploadId="+string(upload.UploadID), bytes.NewReader(body))
+}
+
+type legacyMultipartTestBackend struct {
+	gofakes3.Backend
+	gofakes3.MultipartBackend
+	headErr  error
+	complete func(string, string, gofakes3.UploadID, *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error)
+}
+
+func (b legacyMultipartTestBackend) HeadObject(bucket, key string) (*gofakes3.Object, error) {
+	if b.headErr != nil {
+		return nil, b.headErr
+	}
+	return b.Backend.HeadObject(bucket, key)
+}
+
+func (b legacyMultipartTestBackend) CompleteMultipartUpload(bucket, key string, id gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error) {
+	return b.complete(bucket, key, id, input)
+}
+
+func TestLegacyMultipartWriteConditions(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		match   string
+		headErr gofakes3.ErrorCode
+		status  int
+		code    gofakes3.ErrorCode
+	}{
+		{name: "Malformed", match: `"unterminated`, headErr: gofakes3.ErrInternal, status: http.StatusBadRequest, code: gofakes3.ErrInvalidArgument},
+		{name: "FailedPrecondition", match: `"stale"`, status: http.StatusPreconditionFailed, code: gofakes3.ErrPreconditionFailed},
+		{name: "DestinationError", match: "*", headErr: gofakes3.ErrInternal, status: http.StatusInternalServerError, code: gofakes3.ErrInternal},
+		{name: "MatchingDestination", match: "*", status: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := s3mem.New()
+			require.NoError(t, base.CreateBucket(defaultBucket))
+			const key = "destination"
+			_, err := base.PutObject(defaultBucket, key, nil, strings.NewReader("data"), 4, nil)
+			require.NoError(t, err)
+			backend := legacyMultipartTestBackend{
+				Backend: base,
+				complete: func(bucket, object string, id gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error) {
+					require.Equal(t, http.StatusOK, test.status, "legacy backend must only complete a valid request")
+					require.Equal(t, defaultBucket, bucket)
+					require.Equal(t, key, object)
+					require.Equal(t, gofakes3.UploadID("upload"), id)
+					require.Equal(t, []gofakes3.CompletedPart{{PartNumber: 1, ETag: "etag"}}, input.Parts)
+					return "version", `"etag"`, nil
+				},
+			}
+			if test.headErr != "" {
+				backend.headErr = test.headErr
+			}
+			path := "/" + defaultBucket + "/" + key + "?uploadId=upload"
+			body := strings.NewReader("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>etag</ETag></Part></CompleteMultipartUpload>")
+			req := httptest.NewRequest(http.MethodPost, path, body)
+			req.Header.Set("If-Match", test.match)
+			assertConditionalResponse(t, gofakes3.New(backend).Server(), req, test.status, test.code)
+		})
+	}
+}
+
+func assertConditionalResponse(t *testing.T, handler http.Handler, req *http.Request, status int, code gofakes3.ErrorCode) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, status, rec.Code, rec.Body.String())
+	if code != "" {
+		var response gofakes3.ErrorResponse
+		require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &response))
+		require.Equal(t, code, response.Code)
+	}
 }
